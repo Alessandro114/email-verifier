@@ -1,0 +1,284 @@
+name: Verify Emails (Reacher)
+
+on:
+  workflow_dispatch:
+    inputs:
+      emails_base64:
+        description: 'Base64-encoded email list (one email per line). Max 1000 emails.'
+        required: false
+        type: string
+      artifact_name:
+        description: 'Name of a previously uploaded artifact containing emails.txt'
+        required: false
+        type: string
+      batch_label:
+        description: 'Label for this batch (used in output artifact name)'
+        required: false
+        default: 'batch'
+        type: string
+      rate_limit_ms:
+        description: 'Delay between checks in milliseconds (default: 2000)'
+        required: false
+        default: '2000'
+        type: string
+
+jobs:
+  verify:
+    name: Verify Email Batch
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Download artifact if provided ──────────────────────────────────────
+      - name: Download email list artifact
+        if: ${{ inputs.artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: /tmp/email-input/
+
+      # ── Decode base64 input if provided ───────────────────────────────────
+      - name: Decode base64 email list
+        if: ${{ inputs.emails_base64 != '' }}
+        run: |
+          mkdir -p /tmp/email-input
+          echo "${{ inputs.emails_base64 }}" | base64 -d > /tmp/email-input/emails.txt
+          echo "Decoded $(wc -l < /tmp/email-input/emails.txt) lines."
+
+      # ── Validate input ─────────────────────────────────────────────────────
+      - name: Validate and prepare email list
+        id: prepare
+        run: |
+          INPUT_FILE=""
+          if [ -f /tmp/email-input/emails.txt ]; then
+            INPUT_FILE=/tmp/email-input/emails.txt
+          elif [ -f /tmp/email-input/emails.csv ]; then
+            INPUT_FILE=/tmp/email-input/emails.csv
+          else
+            echo "::error::No email list found. Provide emails_base64 or upload an artifact with emails.txt"
+            exit 1
+          fi
+
+          # Strip whitespace, blank lines, BOM; extract first column if CSV
+          awk -F',' 'NF>0 { gsub(/\r/, ""); gsub(/^[ \t]+|[ \t]+$/, "", $1); if ($1 != "") print $1 }' \
+            "$INPUT_FILE" | grep -v '^email$' | grep -v '^Email$' | grep '@' \
+            > /tmp/emails_clean.txt || true
+
+          TOTAL=$(wc -l < /tmp/emails_clean.txt)
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::error::Email list is empty after cleaning."
+            exit 1
+          fi
+
+          if [ "$TOTAL" -gt 1000 ]; then
+            echo "::warning::Input contains $TOTAL emails; truncating to first 1000."
+            head -1000 /tmp/emails_clean.txt > /tmp/emails_final.txt
+            echo "total=1000" >> "$GITHUB_OUTPUT"
+          else
+            cp /tmp/emails_clean.txt /tmp/emails_final.txt
+          fi
+
+          echo "Prepared $TOTAL email(s) for verification."
+
+      # ── Download Reacher binary ────────────────────────────────────────────
+      - name: Download latest Reacher (check-if-email-exists)
+        run: |
+          API_URL="https://api.github.com/repos/reacherhq/check-if-email-exists/releases/latest"
+          RELEASE_JSON=$(curl -sSf \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$API_URL")
+
+          TAG=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          echo "Latest release: $TAG"
+
+          # Pick the correct asset for linux amd64
+          ASSET_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assets = data.get('assets', [])
+          for a in assets:
+              name = a['name'].lower()
+              if 'linux' in name and ('x86_64' in name or 'amd64' in name) and name.endswith('.tar.gz'):
+                  print(a['browser_download_url'])
+                  break
+          else:
+              # Fallback: first .tar.gz for linux
+              for a in assets:
+                  name = a['name'].lower()
+                  if 'linux' in name and name.endswith('.tar.gz'):
+                      print(a['browser_download_url'])
+                      break
+          ")
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::Could not find a Linux amd64 binary in release $TAG"
+            echo "Available assets:"
+            echo "$RELEASE_JSON" | python3 -c "import sys,json; [print(a['name']) for a in json.load(sys.stdin).get('assets',[])]"
+            exit 1
+          fi
+
+          echo "Downloading: $ASSET_URL"
+          curl -sSfL "$ASSET_URL" -o /tmp/reacher.tar.gz
+          tar -xzf /tmp/reacher.tar.gz -C /tmp/
+
+          # Find the binary (may be named check_if_email_exists or reacher)
+          BINARY=$(find /tmp -maxdepth 3 -type f \( -name "check_if_email_exists" -o -name "reacher" \) | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "::error::Binary not found in archive."
+            find /tmp -maxdepth 3 -type f
+            exit 1
+          fi
+
+          chmod +x "$BINARY"
+          cp "$BINARY" /usr/local/bin/check-if-email-exists
+          echo "Installed: $(check-if-email-exists --version 2>&1 || echo 'version flag not supported')"
+
+      # ── Run verification ───────────────────────────────────────────────────
+      - name: Verify emails
+        env:
+          RATE_LIMIT_MS: ${{ inputs.rate_limit_ms }}
+        run: |
+          mkdir -p /tmp/results
+
+          RATE_MS="${RATE_LIMIT_MS:-2000}"
+          RESULTS_FILE=/tmp/results/results.jsonl
+          TOTAL=$(wc -l < /tmp/emails_final.txt)
+          COUNT=0
+          ERRORS=0
+
+          echo "Starting verification of $TOTAL emails (delay: ${RATE_MS}ms between checks)..."
+          echo "" > "$RESULTS_FILE"
+
+          while IFS= read -r EMAIL; do
+            [ -z "$EMAIL" ] && continue
+            COUNT=$((COUNT + 1))
+            echo "[$COUNT/$TOTAL] Checking: $EMAIL"
+
+            # Run check; capture output and exit code
+            RESULT=$(check-if-email-exists \
+              --from noreply@gmail.com \
+              "$EMAIL" 2>&1) || true
+
+            # check-if-email-exists outputs JSON to stdout
+            # Wrap with metadata if it's valid JSON, otherwise store error
+            if echo "$RESULT" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+              echo "$RESULT" | python3 -c "
+          import sys, json, datetime
+          data = json.load(sys.stdin)
+          data['_checked_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+          print(json.dumps(data))
+          " >> "$RESULTS_FILE"
+            else
+              :
+              ERRORS=$((ERRORS + 1))
+              python3 -c "
+          import json, datetime
+          print(json.dumps({
+            'input': '$EMAIL',
+            'error': $(echo "$RESULT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))"),
+            '_checked_at': datetime.datetime.utcnow().isoformat() + 'Z'
+          }))
+          " >> "$RESULTS_FILE" 2>/dev/null || \
+              echo "{\"input\":\"$EMAIL\",\"error\":\"verification_failed\",\"_checked_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" >> "$RESULTS_FILE"
+            fi
+
+            # Rate limiting — skip sleep after last email
+            if [ "$COUNT" -lt "$TOTAL" ]; then
+              sleep "$(echo "scale=3; $RATE_MS/1000" | bc)"
+            fi
+          done < /tmp/emails_final.txt
+
+          echo "Done. Checked: $COUNT, Errors: $ERRORS"
+          echo "count=$COUNT" >> "$GITHUB_ENV"
+          echo "errors=$ERRORS" >> "$GITHUB_ENV"
+
+      # ── Convert JSONL → single JSON array ─────────────────────────────────
+      - name: Build results JSON
+        run: |
+          BATCH="${{ inputs.batch_label }}"
+          TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          OUT_FILE="/tmp/results/email-verification-${BATCH}-${TIMESTAMP}.json"
+
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          results_dir = "/tmp/results"
+          jsonl_path = os.path.join(results_dir, "results.jsonl")
+          batch = os.environ.get("INPUT_BATCH_LABEL", "batch")
+          timestamp = os.environ.get("TIMESTAMP", "")
+
+          rows = []
+          with open(jsonl_path) as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      rows.append(json.loads(line))
+                  except Exception as e:
+                      rows.append({"_raw": line, "_parse_error": str(e)})
+
+          # Summary stats
+          valid = sum(1 for r in rows if r.get("is_reachable") == "valid")
+          invalid = sum(1 for r in rows if r.get("is_reachable") == "invalid")
+          risky = sum(1 for r in rows if r.get("is_reachable") == "risky")
+          unknown = sum(1 for r in rows if r.get("is_reachable") not in ("valid","invalid","risky"))
+
+          summary = {
+              "total": len(rows),
+              "valid": valid,
+              "invalid": invalid,
+              "risky": risky,
+              "unknown": unknown,
+          }
+
+          output = {
+              "batch": batch,
+              "generated_at": timestamp,
+              "summary": summary,
+              "results": rows,
+          }
+
+          # Write named output file
+          out_name = f"email-verification-{batch}-{timestamp}.json"
+          out_path = os.path.join(results_dir, out_name)
+          with open(out_path, "w") as f:
+              json.dump(output, f, indent=2)
+
+          print(f"Written: {out_path}")
+          print(f"Summary: {summary}")
+          PYEOF
+        env:
+          INPUT_BATCH_LABEL: ${{ inputs.batch_label }}
+          TIMESTAMP: ${{ env.TIMESTAMP }}
+
+      - name: Set timestamp env var
+        run: echo "TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
+
+      # ── Upload results artifact ────────────────────────────────────────────
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-verification-${{ inputs.batch_label }}-results
+          path: /tmp/results/email-verification-*.json
+          retention-days: 7
+          if-no-files-found: error
+
+      # ── Print summary ──────────────────────────────────────────────────────
+      - name: Print summary
+        run: |
+          echo "### Email Verification Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Batch**: ${{ inputs.batch_label }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Emails checked**: ${{ env.count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Verification errors**: ${{ env.errors }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Results artifact: \`email-verification-${{ inputs.batch_label }}-results\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download the artifact to get the full JSON with per-email results and summary stats." >> "$GITHUB_STEP_SUMMARY"
