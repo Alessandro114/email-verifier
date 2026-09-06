@@ -162,7 +162,7 @@ jobs:
 
             # Run check; capture output and exit code
             RESULT=$(check-if-email-exists \
-              --from noreply@gmail.com \
+              --from-email noreply@gmail.com \
               "$EMAIL" 2>&1) || true
 
             # check-if-email-exists outputs JSON to stdout
