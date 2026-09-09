@@ -161,7 +161,7 @@ jobs:
             echo "[$COUNT/$TOTAL] Checking: $EMAIL"
 
             # Run check; capture output and exit code
-            RESULT=$(check-if-email-exists \
+            RESULT=$(timeout 20 check-if-email-exists \
               --from-email noreply@gmail.com \
               "$EMAIL" 2>&1) || true
 
