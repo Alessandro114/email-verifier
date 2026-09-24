@@ -1,4 +1,5 @@
 name: Verify Emails (Reacher)
+run-name: ${{ inputs.batch_label }}
 
 on:
   workflow_dispatch:
