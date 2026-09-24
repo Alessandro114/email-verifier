@@ -16,6 +16,11 @@ on:
         required: false
         default: 'batch'
         type: string
+      concurrency:
+        description: 'Parallel checks (default 30)'
+        required: false
+        default: '30'
+        type: string
       rate_limit_ms:
         description: 'Delay between checks in milliseconds (default: 2000)'
         required: false
@@ -26,7 +31,7 @@ jobs:
   verify:
     name: Verify Email Batch
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -142,61 +147,33 @@ jobs:
       # ── Run verification ───────────────────────────────────────────────────
       - name: Verify emails
         env:
-          RATE_LIMIT_MS: ${{ inputs.rate_limit_ms }}
+          CONCURRENCY: ${{ inputs.concurrency }}
         run: |
           mkdir -p /tmp/results
-
-          RATE_MS="${RATE_LIMIT_MS:-2000}"
-          RESULTS_FILE=/tmp/results/results.jsonl
-          TOTAL=$(wc -l < /tmp/emails_final.txt)
-          COUNT=0
-          ERRORS=0
-
-          echo "Starting verification of $TOTAL emails (delay: ${RATE_MS}ms between checks)..."
-          echo "" > "$RESULTS_FILE"
-
-          while IFS= read -r EMAIL; do
-            [ -z "$EMAIL" ] && continue
-            COUNT=$((COUNT + 1))
-            echo "[$COUNT/$TOTAL] Checking: $EMAIL"
-
-            # Run check; capture output and exit code
-            RESULT=$(timeout 20 check-if-email-exists \
-              --from-email noreply@gmail.com \
-              "$EMAIL" 2>&1) || true
-
-            # check-if-email-exists outputs JSON to stdout
-            # Wrap with metadata if it's valid JSON, otherwise store error
-            if echo "$RESULT" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-              echo "$RESULT" | python3 -c "
-          import sys, json, datetime
-          data = json.load(sys.stdin)
-          data['_checked_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
-          print(json.dumps(data))
-          " >> "$RESULTS_FILE"
-            else
-              :
-              ERRORS=$((ERRORS + 1))
-              python3 -c "
-          import json, datetime
-          print(json.dumps({
-            'input': '$EMAIL',
-            'error': $(echo "$RESULT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))"),
-            '_checked_at': datetime.datetime.utcnow().isoformat() + 'Z'
-          }))
-          " >> "$RESULTS_FILE" 2>/dev/null || \
-              echo "{\"input\":\"$EMAIL\",\"error\":\"verification_failed\",\"_checked_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" >> "$RESULTS_FILE"
-            fi
-
-            # Rate limiting — skip sleep after last email
-            if [ "$COUNT" -lt "$TOTAL" ]; then
-              sleep "$(echo "scale=3; $RATE_MS/1000" | bc)"
-            fi
-          done < /tmp/emails_final.txt
-
-          echo "Done. Checked: $COUNT, Errors: $ERRORS"
-          echo "count=$COUNT" >> "$GITHUB_ENV"
-          echo "errors=$ERRORS" >> "$GITHUB_ENV"
+          python3 - <<'PYEOF'
+          import json, os, subprocess, datetime, time
+          from concurrent.futures import ThreadPoolExecutor
+          conc = int(os.environ.get("CONCURRENCY") or 30)
+          emails = [l.strip() for l in open("/tmp/emails_final.txt") if l.strip()]
+          t0 = time.time()
+          def check(e):
+              ts = datetime.datetime.utcnow().isoformat() + "Z"
+              try:
+                  p = subprocess.run(["timeout", "25", "check-if-email-exists",
+                      "--from-email", "noreply@gmail.com", e],
+                      capture_output=True, text=True)
+                  d = json.loads(p.stdout)
+                  d["_checked_at"] = ts
+                  return d
+              except Exception as ex:
+                  return {"input": e, "error": "verification_failed: " + str(ex)[:120], "_checked_at": ts}
+          with ThreadPoolExecutor(max_workers=conc) as ex, open("/tmp/results/results.jsonl", "w") as f:
+              for r in ex.map(check, emails):
+                  f.write(json.dumps(r) + "\n")
+          n = len(emails)
+          print(f"Done. Checked {n} in {time.time()-t0:.0f}s (concurrency {conc})")
+          open(os.environ["GITHUB_ENV"], "a").write(f"count={n}\nerrors=0\n")
+          PYEOF
 
       # ── Convert JSONL → single JSON array ─────────────────────────────────
       - name: Build results JSON
