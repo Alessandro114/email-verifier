@@ -4,10 +4,6 @@ run-name: ${{ inputs.batch_label }}
 on:
   workflow_dispatch:
     inputs:
-      emails_base64:
-        description: 'Base64-encoded email list (one email per line). Max 1000 emails.'
-        required: false
-        type: string
       artifact_name:
         description: 'Name of a previously uploaded artifact containing emails.txt'
         required: false
@@ -38,6 +34,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── Guardia privacy (T79 05/11): repo pubblico = log e artifact pubblici ──
+      - name: Block real addresses on a public repository
+        if: ${{ github.event.repository.private == false && !startsWith(inputs.artifact_name, 'synthetic-') }}
+        run: |
+          echo "::error::Repo pubblico: log e artifact sono leggibili da chiunque. Solo liste sintetiche (artifact 'synthetic-*'). Per indirizzi reali usare un repo privato."
+          exit 1
+
       # ── Download artifact if provided ──────────────────────────────────────
       - name: Download email list artifact
         if: ${{ inputs.artifact_name != '' }}
@@ -45,14 +48,6 @@ jobs:
         with:
           name: ${{ inputs.artifact_name }}
           path: /tmp/email-input/
-
-      # ── Decode base64 input if provided ───────────────────────────────────
-      - name: Decode base64 email list
-        if: ${{ inputs.emails_base64 != '' }}
-        run: |
-          mkdir -p /tmp/email-input
-          echo "${{ inputs.emails_base64 }}" | base64 -d > /tmp/email-input/emails.txt
-          echo "Decoded $(wc -l < /tmp/email-input/emails.txt) lines."
 
       # ── Validate input ─────────────────────────────────────────────────────
       - name: Validate and prepare email list
@@ -64,7 +59,7 @@ jobs:
           elif [ -f /tmp/email-input/emails.csv ]; then
             INPUT_FILE=/tmp/email-input/emails.csv
           else
-            echo "::error::No email list found. Provide emails_base64 or upload an artifact with emails.txt"
+            echo "::error::No email list found. Upload an artifact with emails.txt"
             exit 1
           fi
 
